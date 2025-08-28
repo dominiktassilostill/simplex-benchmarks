@@ -1,5 +1,6 @@
-# simplex-benchmarks
+# Simplex-Benchmarks
 Benchmark code for "Matrix-Free Evaluation Strategies for Continuous and Discontinuous Galerkin Discretizations on Unstructured Tetrahedral Grids"
+
 This repository implements the optimized matrix-free finite-element operator described in
 *Still, Fehn, Wall & Kronbichler, "Matrix-Free Evaluation Strategies for Continuous and
 Discontinuous Galerkin Discretizations on Unstructured Tetrahedral Grids"* (submitted).
@@ -19,4 +20,4 @@ cmake -D DEAL_II_DIR=/path/to/deal.II .
 make -j <Nproc>
 mpirun -n <Nproc> ./bench <dim> <degree>
 ```
-
+Select dim as 3 and degree between 1 and 3. To run the hybrid multigrid benchmarks, go the corresponding folder and build the version of the multigrid preconditioner you want to run. The two or three letter abbreviations are the transfer operations in corresponding order. Further code for the hybrid multigrid can be found [here](https://github.com/dominiktassilostill/exadg/tree/maskedgather2), optimized hexahedral code can be found [here](https://github.com/kronbichler/multigrid/).
