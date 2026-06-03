@@ -58,18 +58,18 @@ using namespace dealii;
 
 double const FREQUENCY = 3.0 * dealii::numbers::PI;
 
-template <int dim>
-class AnalyticalRHS : public dealii::Function<dim>
+template <int dim, typename Number>
+class AnalyticalRHS : public dealii::Function<dim,Number>
 {
 public:
   AnalyticalRHS()
-    : dealii::Function<dim>(1, 0.0)
+    : dealii::Function<dim,Number>(1, 0.0)
   {}
 
-  double
+  Number
   value(const dealii::Point<dim> &p, const unsigned int) const final
   {
-    double result = FREQUENCY * FREQUENCY * dim;
+    Number result = FREQUENCY * FREQUENCY * dim;
     for(unsigned int d = 0; d < dim; ++d)
       result *= std::sin(FREQUENCY * p[d]);
 
@@ -79,18 +79,18 @@ public:
 };
 
 
-template <int dim>
-class AnalyticalSolution : public dealii::Function<dim>
+template <int dim, typename Number>
+class AnalyticalSolution : public dealii::Function<dim,Number>
 {
 public:
   AnalyticalSolution()
-    : dealii::Function<dim>(1, 0.0)
+    : dealii::Function<dim,Number>(1, 0.0)
   {}
 
-  double
+  Number
   value(const dealii::Point<dim> &p, const unsigned int) const final
   {
-    double result = 1.0;
+    Number result = 1.0;
     for(unsigned int d = 0; d < dim; ++d)
       result *= std::sin(FREQUENCY * p[d]);
 
@@ -101,7 +101,7 @@ public:
 
 template <int dim, typename Number>
 VectorizedArray<Number>
-evaluate_function(const Function<dim>                       &function,
+evaluate_function(const Function<dim,Number>                       &function,
                          const Point<dim, VectorizedArray<Number>> &p_vectorized)
 {
   AssertDimension(function.n_components, 1);
@@ -1261,12 +1261,12 @@ public:
       auto const reference_cells =
         matrix_free.get_dof_handler().get_triangulation().get_reference_cells();
 
-      auto const quadrature = reference_cells[0].template get_gauss_type_quadrature<dim>(degree + 1);
+      auto const quadrature = QGaussSimplex<dim>(degree + 1);//reference_cells[0].template get_gauss_type_quadrature<dim>(degree + 1);
       dealii::FEValues<dim> fe_values(mapping, fe, quadrature, dealii::update_JxW_values);
 
-      auto const face_quadrature =
-        reference_cells[0].face_reference_cell(0).template get_gauss_type_quadrature<dim - 1>(degree +
-                                                                                              1);
+      auto const face_quadrature = QGaussSimplex<dim-1>(degree + 1);
+        //reference_cells[0].face_reference_cell(0).template get_gauss_type_quadrature<dim - 1>(degree +
+        //                                                                                      1);
       dealii::FEFaceValues<dim> fe_face_values(mapping, fe, face_quadrature, dealii::update_JxW_values);
 
       for(unsigned int i = 0; i < n_cells; ++i)
@@ -1573,7 +1573,7 @@ private:
     const std::pair<unsigned int, unsigned int> &range) const
   {
     FECellIntegrator integrator(matrix_free, range);
-    AnalyticalRHS<dim> rhs;
+    AnalyticalRHS<dim,number> rhs;
 
     for (unsigned int cell = range.first; cell < range.second; ++cell)
       {
@@ -1607,7 +1607,7 @@ private:
     const std::pair<unsigned int, unsigned int> &range) const
   {
     FEFaceIntegrator integrator(matrix_free, range);
-    AnalyticalSolution<dim> sol;
+    AnalyticalSolution<dim,number> sol;
 
     for (unsigned int cell = range.first; cell < range.second; ++cell)
       {
@@ -3655,7 +3655,7 @@ private:
 
 template <int dim, typename Number>
 void
-do_test(const unsigned int fe_degree)
+do_test(const unsigned int fe_degree, const bool do_multigrid)
 {
   ConditionalOStream pcout(std::cout,
                            Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) ==
@@ -3668,7 +3668,7 @@ do_test(const unsigned int fe_degree)
 
   AffineConstraints<Number> constraint;
 
-  for (unsigned int refinement = 0;  refinement < 3; ++refinement) //refinement < n_refinements &&
+  for (unsigned int refinement = 6;  refinement < 7; ++refinement) //refinement < n_refinements &&
     {
       const auto serial_grid_generator =
         [&](dealii::Triangulation<dim, dim> &tria_serial) {
@@ -3755,7 +3755,11 @@ do_test(const unsigned int fe_degree)
                 << 1e-9 * dof_handler.n_dofs() * 1 / run_time << std::endl;
         }
 
-      for (unsigned int r = 0; r < 1; ++r)
+      const unsigned int n_rep = do_multigrid ? 1: 10;
+      const unsigned int n_loops = do_multigrid ? 1: 100;
+        MPI_Barrier(MPI_COMM_WORLD);
+
+      for (unsigned int r = 0; r < n_rep; ++r)
         {
 #ifdef LIKWID_PERFMON
           LIKWID_MARKER_START(("matvec_manual_p" + std::to_string(fe_degree) +
@@ -3763,7 +3767,7 @@ do_test(const unsigned int fe_degree)
                                 .c_str());
 #endif
           Timer time;
-          for (unsigned int t = 0; t < 1; ++t)
+          for (unsigned int t = 0; t < n_loops; ++t)
             op.vmult(vec3, vec1);
           const double run_time = time.wall_time();
 #ifdef LIKWID_PERFMON
@@ -3772,42 +3776,79 @@ do_test(const unsigned int fe_degree)
                                .c_str());
 #endif
           pcout << "n_dofs " << dof_handler.n_dofs() << "  time manual "
-                << run_time / 1 << "  GDoFs/s "
-                << 1e-9 * dof_handler.n_dofs() * 1 / run_time << std::endl;
+                << run_time / n_loops << "  GDoFs/s "
+                << 1e-9 * dof_handler.n_dofs() * n_loops / run_time << std::endl;
         }
 
       vec3 -= vec2;
       pcout << "Verification: " << vec3.l2_norm() / vec2.l2_norm() << std::endl;
       pcout << std::endl;
 
-      unsigned int n_iterations = 0;
-      op.rhs(b);
+      if(do_multigrid)
+      {
+        unsigned int n_iterations = 0;
+        op.rhs(b);
 
-      MultigridPreconditioner<dim, Number, float> multigrid(op);
+        pcout << "Mixed precision MG" << std::endl;
+        MultigridPreconditioner<dim, Number, float> multigrid(op);
 
-      MPI_Barrier(MPI_COMM_WORLD);
-      for (unsigned int r = 0; r < 1; ++r)
-        {
-          x = 0.;
+        MPI_Barrier(MPI_COMM_WORLD);
+        for (unsigned int r = 0; r < 1; ++r)
+          {
+            x = 0.;
 #ifdef LIKWID_PERFMON
-          LIKWID_MARKER_START(("mg_solve_p" + std::to_string(fe_degree) + "_s" +
-                               std::to_string(dof_handler.n_dofs()))
+            LIKWID_MARKER_START(("mg_solve_p" + std::to_string(fe_degree) + "_s" +
+                                std::to_string(dof_handler.n_dofs()))
+                                  .c_str());
+#endif
+            for (unsigned int t = 0; t < 1; ++t)
+              n_iterations = multigrid.solve(op, x, b);
+#ifdef LIKWID_PERFMON
+            LIKWID_MARKER_STOP(("mg_solve_p" + std::to_string(fe_degree) + "_s" +
+                                std::to_string(dof_handler.n_dofs()))
                                 .c_str());
 #endif
-          for (unsigned int t = 0; t < 1; ++t)
-            n_iterations = multigrid.solve(op, x, b);
-#ifdef LIKWID_PERFMON
-          LIKWID_MARKER_STOP(("mg_solve_p" + std::to_string(fe_degree) + "_s" +
-                              std::to_string(dof_handler.n_dofs()))
-                               .c_str());
-#endif
+          }
+        
+          AnalyticalSolution<dim,Number> exact_solution;
+          VectorTools::interpolate<dim,dim,LinearAlgebra::distributed::Vector<Number>>(mapping, dof_handler, exact_solution, vec1);
+          x -= vec1;
+          pcout << "relative L2 error: " << x.l2_norm() / vec1.l2_norm() << std::endl;
+          pcout << std::endl;
         }
-      
-        AnalyticalSolution<dim> exact_solution;
-        VectorTools::interpolate(mapping, dof_handler, exact_solution, vec1);
-        x -= vec1;
-        pcout << "relative L2 error: " << x.l2_norm() / vec1.l2_norm() << std::endl;
-        pcout << std::endl;
+
+        if(do_multigrid)
+      {
+        unsigned int n_iterations = 0;
+        op.rhs(b);
+
+        pcout << "Double precision MG" << std::endl;
+        MultigridPreconditioner<dim, Number, Number> multigrid(op);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        for (unsigned int r = 0; r < 1; ++r)
+          {
+            x = 0.;
+#ifdef LIKWID_PERFMON
+            LIKWID_MARKER_START(("mg_solve_p" + std::to_string(fe_degree) + "_s" +
+                                std::to_string(dof_handler.n_dofs()))
+                                  .c_str());
+#endif
+            for (unsigned int t = 0; t < 1; ++t)
+              n_iterations = multigrid.solve(op, x, b);
+#ifdef LIKWID_PERFMON
+            LIKWID_MARKER_STOP(("mg_solve_p" + std::to_string(fe_degree) + "_s" +
+                                std::to_string(dof_handler.n_dofs()))
+                                .c_str());
+#endif
+          }
+        
+          AnalyticalSolution<dim,Number> exact_solution;
+          VectorTools::interpolate<dim,dim,LinearAlgebra::distributed::Vector<Number>>(mapping, dof_handler, exact_solution, vec1);
+          x -= vec1;
+          pcout << "relative L2 error: " << x.l2_norm() / vec1.l2_norm() << std::endl;
+          pcout << std::endl;
+        }
     }
 }
 
@@ -3830,9 +3871,14 @@ main(int argc, char **argv)
     degree = std::atoi(argv[2]);
 
   if (dim == 2)
-    do_test<2, double>(degree);
+    do_test<2, double>(degree, false);
   else
-    do_test<3, double>(degree);
+  {
+    do_test<3, float>(degree, false);
+    do_test<3, double>(degree, false);
+    do_test<3, double>(degree, true);
+
+  }
 
 #ifdef LIKWID_PERFMON
   LIKWID_MARKER_CLOSE;

@@ -1161,12 +1161,12 @@ public:
       auto const reference_cells =
         matrix_free.get_dof_handler().get_triangulation().get_reference_cells();
 
-      auto const quadrature = reference_cells[0].template get_gauss_type_quadrature<dim>(degree + 1);
+      auto const quadrature = QGaussSimplex<dim>(degree + 1); //reference_cells[0].template get_gauss_type_quadrature<dim>(degree + 1);
       dealii::FEValues<dim> fe_values(mapping, fe, quadrature, dealii::update_JxW_values);
 
-      auto const face_quadrature =
-        reference_cells[0].face_reference_cell(0).template get_gauss_type_quadrature<dim - 1>(degree +
-                                                                                              1);
+      auto const face_quadrature = QGaussSimplex<dim-1>(degree + 1); 
+        //reference_cells[0].face_reference_cell(0).template get_gauss_type_quadrature<dim - 1>(degree +
+          //                                                                                    1);
       dealii::FEFaceValues<dim> fe_face_values(mapping, fe, face_quadrature, dealii::update_JxW_values);
 
       for(unsigned int i = 0; i < n_cells; ++i)
@@ -1679,36 +1679,61 @@ private:
     const VectorType                            &src,
     const std::pair<unsigned int, unsigned int> &range) const
   {
-    constexpr int                          NUM_FACES        = 4;
-    constexpr int                          NUM_ORIENTATIONS = 6;
-    std::vector<std::vector<unsigned int>> face_batches(
-      NUM_FACES * NUM_FACES * NUM_ORIENTATIONS * NUM_ORIENTATIONS);
+    if(false)
+    {
+      constexpr int                          NUM_FACES        = 4;
+      constexpr int                          NUM_ORIENTATIONS = 6;
+      std::vector<std::vector<unsigned int>> face_batches(
+        NUM_FACES * NUM_FACES * NUM_ORIENTATIONS * NUM_ORIENTATIONS);
 
-    for (unsigned int face = range.first; face < range.second; ++face)
-      {
-        const auto          face_info       = matrix_free.get_face_info(face);
-        const unsigned char face_number_int = face_info.interior_face_no;
-        const unsigned char face_number_ext = face_info.exterior_face_no;
-        const unsigned char face_orientation_int =
-          (true == (face_info.face_orientation >= 8)) ?
-            (face_info.face_orientation % 8) :
-            0;
-        const unsigned char face_orientation_ext =
-          (false == (face_info.face_orientation >= 8)) ?
-            (face_info.face_orientation % 8) :
-            0;
+      for (unsigned int face = range.first; face < range.second; ++face)
+        {
+          const auto          face_info       = matrix_free.get_face_info(face);
+          const unsigned char face_number_int = face_info.interior_face_no;
+          const unsigned char face_number_ext = face_info.exterior_face_no;
+          const unsigned char face_orientation_int =
+            (true == (face_info.face_orientation >= 8)) ?
+              (face_info.face_orientation % 8) :
+              0;
+          const unsigned char face_orientation_ext =
+            (false == (face_info.face_orientation >= 8)) ?
+              (face_info.face_orientation % 8) :
+              0;
 
-        face_batches[face_number_int * NUM_FACES * NUM_ORIENTATIONS *
-                       NUM_ORIENTATIONS +
-                     face_number_ext * NUM_ORIENTATIONS * NUM_ORIENTATIONS +
-                     face_orientation_int * NUM_ORIENTATIONS +
-                     face_orientation_ext]
-          .push_back(face);
-      }
+          face_batches[face_number_int * NUM_FACES * NUM_ORIENTATIONS *
+                        NUM_ORIENTATIONS +
+                      face_number_ext * NUM_ORIENTATIONS * NUM_ORIENTATIONS +
+                      face_orientation_int * NUM_ORIENTATIONS +
+                      face_orientation_ext]
+            .push_back(face);
+        }
 
-    for (auto &face_batch : face_batches)
-      if (!face_batch.empty())
-        compute_batched_face_integrals(matrix_free, dst, src, face_batch);
+      for (auto &face_batch : face_batches)
+        if (!face_batch.empty())
+          compute_batched_face_integrals(matrix_free, dst, src, face_batch);
+    }
+    else
+    {
+      constexpr int                          NUM_FACES        = 4;
+      std::vector<std::vector<unsigned int>> face_batches(
+        NUM_FACES * NUM_FACES);
+
+      for (unsigned int face = range.first; face < range.second; ++face)
+        {
+          const auto          face_info       = matrix_free.get_face_info(face);
+          const unsigned char face_number_int = face_info.interior_face_no;
+          const unsigned char face_number_ext = face_info.exterior_face_no;
+         
+
+          face_batches[face_number_int * NUM_FACES  +
+                      face_number_ext]
+            .push_back(face);
+        }
+
+      for (auto &face_batch : face_batches)
+        if (!face_batch.empty())
+          compute_batched_face_integrals(matrix_free, dst, src, face_batch);
+    }
   }
 
   void
@@ -1745,8 +1770,14 @@ private:
         (face_info.face_orientation % 8) :
         0;
 
+
+     // const std::vector<std::vector<unsigned int>> quad_offsets{{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14},{0,5,2,1,4,3,6,7,8,9,10,11,12,13,14},{2,0,6,7,8,9,10,11,12,13,14,4,3,5,1},{2,4,1,6,7,8,9,10,11,12,13,14,3,5,0},{4,1,3,5,2,6,7,8,9,10,11,12,13,14,0},{1,5,6,7,8,9,10,11,12,13,14,2,4,0,3}};
+     const std::vector<std::vector<unsigned int>> quad_offsets{{0,1,2,3},{0,1,2,3},{0,1,2,3},{0,1,2,3},{0,1,2,3},{0,1,2,3}};
+     
     const unsigned int n_q_points =
       shape_info.n_q_points_faces[face_number_int];
+
+      std::cout << "N q points " << n_q_points << std::endl;
 
     scratch_data->resize_fast(2 * batch_size *
                               (dim * n_q_points + n_q_points + dofs_per_cell));
@@ -2036,25 +2067,28 @@ private:
               {
                 for (unsigned int q = 0; q < n_q_points; ++q)
                   {
+                    const unsigned int q_int = quad_offsets[face_orientation_int][q];
+                    const unsigned int q_ext = quad_offsets[face_orientation_ext][q];
+
                     const VectorizedArray<number> solution_jump =
-                      values_quad_int[batch * n_q_points + q] -
-                      values_quad_ext[batch * n_q_points + q];
+                      values_quad_int[batch * n_q_points + q_int] -
+                      values_quad_ext[batch * n_q_points + q_ext];
 
                     VectorizedArray<number> grad_int =
-                      gradients_quad_int[batch * n_q_points * dim + q * dim] *
+                      gradients_quad_int[batch * n_q_points * dim + q_int * dim] *
                       normal_x_jacobian_int[0][0];
                     VectorizedArray<number> grad_ext =
-                      gradients_quad_ext[batch * n_q_points * dim + q * dim] *
+                      gradients_quad_ext[batch * n_q_points * dim + q_ext * dim] *
                       normal_x_jacobian_ext[0][0];
                     for (unsigned int d = 1; d < dim; ++d)
                       {
                         grad_int +=
                           gradients_quad_int[batch * n_q_points * dim +
-                                             q * dim + d] *
+                                             q_int * dim + d] *
                           normal_x_jacobian_int[0][d];
                         grad_ext +=
                           gradients_quad_ext[batch * n_q_points * dim +
-                                             q * dim + d] *
+                                             q_ext * dim + d] *
                           normal_x_jacobian_ext[0][d];
                       }
                     const VectorizedArray<number> averaged_normal_derivative =
@@ -2063,22 +2097,22 @@ private:
                     const VectorizedArray<number> test_by_value =
                       solution_jump * sigma - averaged_normal_derivative;
 
-                    values_quad_int[batch * n_q_points + q] =
-                      test_by_value * j_value[0] * quadrature_weights[q];
-                    values_quad_ext[batch * n_q_points + q] =
-                      -test_by_value * j_value[0] * quadrature_weights[q];
+                    values_quad_int[batch * n_q_points + q_int] =
+                      test_by_value * j_value[0] * quadrature_weights[q_int];
+                    values_quad_ext[batch * n_q_points + q_ext] =
+                      -test_by_value * j_value[0] * quadrature_weights[q_ext];
 
                     for (unsigned int d = 0; d < dim; ++d)
                       {
-                        gradients_quad_int[batch * n_q_points * dim + q * dim +
+                        gradients_quad_int[batch * n_q_points * dim + q_int * dim +
                                            d] =
                           (-solution_jump * number(0.5) * j_value[0] *
-                           quadrature_weights[q]) *
+                           quadrature_weights[q_int]) *
                           normal_x_jacobian_int[0][d];
-                        gradients_quad_ext[batch * n_q_points * dim + q * dim +
+                        gradients_quad_ext[batch * n_q_points * dim + q_ext * dim +
                                            d] =
                           (-solution_jump * number(0.5) * j_value[0] *
-                           quadrature_weights[q]) *
+                           quadrature_weights[q_ext]) *
                           normal_x_jacobian_ext[0][d];
                       }
                   }
@@ -2752,7 +2786,7 @@ void
 do_test(const unsigned int fe_degree)
 {
   const bool use_manifold = false;
-  const bool grid_in      = true;
+  const bool grid_in      = false;
   const bool reorder_grid = false;
 
   ConditionalOStream pcout(std::cout,
@@ -2847,7 +2881,7 @@ do_test(const unsigned int fe_degree)
     refinements.resize(1);
 }
 
-  for (unsigned int refinement = 0;  refinement < refinements.size(); ++refinement) //refinement < n_refinements &&
+  for (unsigned int refinement = 0;  refinement < 1; ++refinement) //refinements.size(); ++refinement) //refinement < n_refinements &&
     {
       const auto serial_grid_generator =
         [&refinement,
@@ -2922,14 +2956,14 @@ do_test(const unsigned int fe_degree)
             {
               // set up triangulation
               GridGenerator::subdivided_hyper_cube_with_simplices(
-                tria_serial, n_subdivisions[refinement]);
+                tria_serial, 1);
               if (use_manifold)
                 {
                   tria_serial.set_all_manifold_ids(0);
                   tria_serial.set_manifold(0, manifold);
                 }
 
-              tria_serial.refine_global(refinements[refinement]);
+              tria_serial.refine_global(0+refinements[refinement]);
             }
         };
       const auto serial_grid_partitioner =
@@ -2989,7 +3023,7 @@ do_test(const unsigned int fe_degree)
         a = static_cast<double>(rand()) / RAND_MAX;
 
       MPI_Barrier(MPI_COMM_WORLD);
-      for (unsigned int r = 0; r < 5; ++r)
+      for (unsigned int r = 0; r < 1; ++r)
         {
 #ifdef LIKWID_PERFMON
           LIKWID_MARKER_START(("matvec_p" + std::to_string(fe_degree) + "_s" +

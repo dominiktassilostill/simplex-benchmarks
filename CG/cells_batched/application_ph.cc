@@ -79,18 +79,18 @@ public:
 };
 
 
-template <int dim>
-class AnalyticalSolution : public dealii::Function<dim>
+template <int dim, typename Number>
+class AnalyticalSolution : public dealii::Function<dim,Number>
 {
 public:
   AnalyticalSolution()
-    : dealii::Function<dim>(1, 0.0)
+    : dealii::Function<dim,Number>(1, 0.0)
   {}
 
-  double
+  Number
   value(const dealii::Point<dim> &p, const unsigned int) const final
   {
-    double result = 1.0;
+    Number result = 1.0;
     for(unsigned int d = 0; d < dim; ++d)
       result *= std::sin(FREQUENCY * p[d]);
 
@@ -1660,15 +1660,41 @@ private:
 
 
 
+
+template <typename Number>
+void
+make_zero_mean(const std::vector<unsigned int>                    &constrained_dofs,
+               dealii::LinearAlgebra::distributed::Vector<Number> &vec)
+{
+  // set constrained entries to zero
+  for (const unsigned int index : constrained_dofs)
+    vec.local_element(index) = 0.;
+
+  // rescale mean value computed among all vector entries to the vector size
+  // without constraints
+  const unsigned int n_unconstrained_dofs =
+    vec.locally_owned_size() - constrained_dofs.size();
+  vec.add(-vec.mean_value() * vec.size() /
+          dealii::Utilities::MPI::sum(n_unconstrained_dofs, vec.get_mpi_communicator()));
+
+  // set constrained entries to zero again, this should now have zero mean
+  for (const unsigned int index : constrained_dofs)
+    vec.local_element(index) = 0.;
+}
+
+
 template <typename VectorType>
 class MGCoarseAMG : public MGCoarseGridBase<VectorType>
 {
 private:
 public:
-  MGCoarseAMG(const TrilinosWrappers::PreconditionAMG &amg, const bool is_singular_in)
+  MGCoarseAMG(const std::vector<unsigned int>         &constrained_dofs,
+              const TrilinosWrappers::PreconditionAMG &amg,
+              const bool                               is_singular_in)
   {
-    amg_preconditioner = &amg;
-    is_singular        = is_singular_in;
+    this->constrained_dofs = constrained_dofs;
+    amg_preconditioner     = &amg;
+    is_singular            = is_singular_in;
   }
 
   void
@@ -1682,8 +1708,9 @@ public:
         if (is_singular)
           {
             VectorType r(src);
-            dealii::VectorTools::subtract_mean_value(r);
+            make_zero_mean(constrained_dofs, r);
             amg_preconditioner->vmult(dst, r);
+            make_zero_mean(constrained_dofs, dst);
           }
         else
           amg_preconditioner->vmult(dst, src);
@@ -1707,6 +1734,7 @@ public:
 private:
   const TrilinosWrappers::PreconditionAMG *amg_preconditioner;
   bool                                     is_singular;
+  std::vector<unsigned int>                constrained_dofs;
 };
 
 template <int dim, typename number_operator, typename number = number_operator>
@@ -1724,10 +1752,10 @@ class MultigridPreconditioner
     PreconditionMG<dim, VectorType, MGTransferGlobalCoarsening<dim, VectorType>>;
 
 public:
-  MultigridPreconditioner(SystemMatrixType &opppppp)
+  MultigridPreconditioner(SystemMatrixType &op)
   {
     const auto &dof_handler =
-      opppppp.get_matrix_free().get_dof_handler();
+      op.get_matrix_free().get_dof_handler();
 
     // create coarse grid triangulations
     {
@@ -1905,13 +1933,14 @@ public:
   }
 
   unsigned int
-  solve(SystemMatrixType       &oppp,
+  solve(SystemMatrixType       &op,
         VectorTypeSystem       &x,
         const VectorTypeSystem &b)
   {
     // Coarse grid solver
     std::unique_ptr<MGCoarseGridBase<VectorType>> mg_coarse;
-    mg_coarse = std::make_unique<MGCoarseAMG<VectorType>>(precondition_amg,
+    mg_coarse = std::make_unique<MGCoarseAMG<VectorType>>(std::vector<unsigned int>(),
+                                                          precondition_amg,
                                                           false);
 
     // Setup levels and transfers
@@ -1919,7 +1948,7 @@ public:
     Multigrid<VectorType>  mg(mg_matrix, *mg_coarse, transfer, mg_smoother, mg_smoother);
 
     PreconditionerType preconditioner(
-      oppp.get_matrix_free().get_dof_handler(), mg, transfer);
+      op.get_matrix_free().get_dof_handler(), mg, transfer);
 
     SolverControl              control(100000, 1e-10 * b.l2_norm());
     SolverCG<VectorTypeSystem> solver_cg(control);
@@ -1930,7 +1959,7 @@ public:
     {
       x = 0.;
       Timer time;
-      solver_cg.solve(oppp, x, b, preconditioner);
+      solver_cg.solve(op, x, b, preconditioner);
       const double run_time = time.wall_time();
       min_time = std::min(min_time, run_time);
       time_total += run_time;
@@ -1941,9 +1970,9 @@ public:
       Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) ==
         0);
     unsigned int n    = control.last_step();
-    pcout << "n_dofs " << oppp.get_matrix_free().get_dof_handler().n_dofs() << "  time "
+    pcout << "n_dofs " << op.get_matrix_free().get_dof_handler().n_dofs() << "  time "
                 << time_total / 100 << "   1e5 DoFs/s "
-                << 1e-5 * oppp.get_matrix_free().get_dof_handler().n_dofs() * 100 / time_total << " in " << n << " iterations" << std::endl;
+                << 1e-5 * op.get_matrix_free().get_dof_handler().n_dofs() * 100 / time_total << " in " << n << " iterations" << std::endl;
 
     
     double l2_0 = control.initial_value();
@@ -1953,7 +1982,7 @@ public:
     unsigned int const N_mpi_processes = dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD);
     double const t_10 = run_time * double(n10) / double(n);
   
-    double const tau_10 = t_10 * (double)N_mpi_processes / oppp.get_matrix_free().get_dof_handler().n_dofs();
+    double const tau_10 = t_10 * (double)N_mpi_processes / op.get_matrix_free().get_dof_handler().n_dofs();
     const double E_10 = 1.0 / tau_10;
 
     pcout << "n_10 " << n10 << "  t_10 "
@@ -1984,7 +2013,7 @@ private:
 
 template <int dim, typename Number>
 void
-do_test(const unsigned int fe_degree)
+do_test(const unsigned int fe_degree, const bool do_multigrid = true)
 {
   ConditionalOStream pcout(std::cout,
                            Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) ==
@@ -1997,7 +2026,7 @@ do_test(const unsigned int fe_degree)
 
   AffineConstraints<Number> constraint;
 
-  for (unsigned int refinement = 0;  refinement < 3; ++refinement) //refinement < n_refinements &&
+  for (unsigned int refinement = 6;  refinement < 7; ++refinement) //refinement < n_refinements &&
     {
       const auto serial_grid_generator =
         [&](dealii::Triangulation<dim, dim> &tria_serial) {
@@ -2049,7 +2078,7 @@ do_test(const unsigned int fe_degree)
             mapping,
             dof_handler,
             0,
-            AnalyticalSolution<dim>(),
+            AnalyticalSolution<dim,Number>(),
             constraint);
           constraint.close();
           typename MatrixFree<dim, Number>::AdditionalData data;
@@ -2061,8 +2090,8 @@ do_test(const unsigned int fe_degree)
         DoFTools::extract_locally_relevant_dofs(dof_handler);
       constraint.reinit(dof_handler.locally_owned_dofs(),
                         locally_relevant_dofs);
-      VectorTools::interpolate_boundary_values(
-        mapping, dof_handler, 0, AnalyticalSolution<dim>(), constraint);
+      VectorTools::interpolate_boundary_values<dim, dim, Number>(
+        mapping, dof_handler, 0, AnalyticalSolution<dim,Number>(), constraint);
       constraint.close();
 
       Operator<dim, Number> op;
@@ -2108,15 +2137,19 @@ do_test(const unsigned int fe_degree)
                 << 1e-9 * dof_handler.n_dofs() * 1 / run_time << std::endl;
         }
 
-      for (unsigned int r = 0; r < 1; ++r)
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      const unsigned int n_repretitaions = do_multigrid ? 1 : 10;
+      for (unsigned int r = 0; r < n_repretitaions; ++r)
         {
+        const unsigned int n_loops = do_multigrid ? 1 : 100;
 #ifdef LIKWID_PERFMON
           LIKWID_MARKER_START(("matvec_manual_p" + std::to_string(fe_degree) +
                                "_s" + std::to_string(dof_handler.n_dofs()))
                                 .c_str());
 #endif
           Timer time;
-          for (unsigned int t = 0; t < 1; ++t)
+          for (unsigned int t = 0; t < n_loops; ++t)
             op.vmult(vec3, vec1);
           const double run_time = time.wall_time();
 #ifdef LIKWID_PERFMON
@@ -2125,18 +2158,22 @@ do_test(const unsigned int fe_degree)
                                .c_str());
 #endif
           pcout << "n_dofs " << dof_handler.n_dofs() << "  time manual "
-                << run_time / 1 << "  GDoFs/s "
-                << 1e-9 * dof_handler.n_dofs() * 1 / run_time << std::endl;
+                << run_time / 100 << "  GDoFs/s "
+                << 1e-9 * dof_handler.n_dofs() * 100 / run_time << std::endl;
         }
 
       vec3 -= vec2;
       pcout << "Verification: " << vec3.l2_norm() / vec2.l2_norm() << std::endl;
       pcout << std::endl;
 
+      if(do_multigrid)
+      {
       unsigned int n_iterations = 0;
       op.rhs(b);
 
-      MultigridPreconditioner<dim, Number, float> multigrid(op);
+      MultigridPreconditioner<dim, Number, Number> multigrid(op);
+
+      pcout << "MG solver double precision" << std::endl;
 
       MPI_Barrier(MPI_COMM_WORLD);
       for (unsigned int r = 0; r < 1; ++r)
@@ -2156,12 +2193,41 @@ do_test(const unsigned int fe_degree)
 #endif
         }
       
-        AnalyticalSolution<dim> exact_solution;
-        VectorTools::interpolate(mapping, dof_handler, exact_solution, vec1);
+        AnalyticalSolution<dim,Number> exact_solution;
+        VectorTools::interpolate<dim,dim,LinearAlgebra::distributed::Vector<Number>>(mapping, dof_handler, exact_solution, vec1);
         x -= vec1;
         pcout << "relative L2 error: " << x.l2_norm() / vec1.l2_norm() << std::endl;
         pcout << std::endl;
-    }
+
+      pcout << "MG solver mixed precision" << std::endl;
+
+    MultigridPreconditioner<dim, Number, float> multigrid_mixed(op);
+
+      MPI_Barrier(MPI_COMM_WORLD);
+      for (unsigned int r = 0; r < 1; ++r)
+        {
+          x = 0.;
+          Timer time;
+#ifdef LIKWID_PERFMON
+          LIKWID_MARKER_START(("mg_solve_p_float" + std::to_string(fe_degree) + "_s" +
+                               std::to_string(dof_handler.n_dofs()))
+                                .c_str());
+#endif
+          for (unsigned int t = 0; t < 1; ++t)
+            n_iterations = multigrid_mixed.solve(op, x, b);
+#ifdef LIKWID_PERFMON
+          LIKWID_MARKER_STOP(("mg_solve_p_mixed" + std::to_string(fe_degree) + "_s" +
+                              std::to_string(dof_handler.n_dofs()))
+                               .c_str());
+#endif
+        }
+
+        VectorTools::interpolate<dim,dim,LinearAlgebra::distributed::Vector<Number>>(mapping, dof_handler, exact_solution, vec1);
+        x -= vec1;
+        pcout << "relative L2 error: " << x.l2_norm() / vec1.l2_norm() << std::endl;
+        pcout << std::endl;
+        }
+}
 }
 
 
@@ -2185,8 +2251,10 @@ main(int argc, char **argv)
   if (dim == 2)
     do_test<2, double>(degree);
   else
-    do_test<3, double>(degree);
-
+  {
+    do_test<3, float>(degree, false);
+    do_test<3, double>(degree, false);
+  }
 #ifdef LIKWID_PERFMON
   LIKWID_MARKER_CLOSE;
 #endif
