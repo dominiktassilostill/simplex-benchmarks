@@ -1,4 +1,23 @@
 
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the optimized Poisson operator for continuous finite
+ * elements discretizations. Applies the components batched strategie (see Section 2.4),
+ * all optimizations explained in the paper are applied,  
+ * possible choices are curvlinear elements, grid reordering and
+ * single or double precision runs.
+ * Further the code compares the native deal.ii implementation and the sparse global 
+ * matrix version based on Trilinos.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * See CG/cells_batched/application.cc for reference. This application implements the 
+ * DG verion, requiring additional faces integrals. On the face the values as well as the
+ * gradients are needed at the quadarature points. Therefore, additional calls of the 
+ * matrix-matrix kernels are needed, yet it can be seen in the code that the same
+ * functionallity is used for values and gradients (also applies to cells and faces)
+ * employing identical optimized kernels. 
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
@@ -36,6 +55,13 @@ using namespace dealii;
 
 
 
+// matrix-matrix multiplication kernels
+// see Section 2.4 for details
+// entails spatial blocking and manual loop unrolling
+// the code supports the batch size 2 on n_SIMD lanes
+// such it multiplies 2 * n_SIMD cells in one sweep
+// can be applied in single or double precision
+// operates with 5 times manunal unrolled loops
 template <bool transpose_matrix, bool add, typename Number, typename Number2>
 void
 apply_matrix_vector_product_2(const Number2 *matrix,
@@ -425,6 +451,13 @@ apply_matrix_vector_product_2(const Number2 *matrix,
     }
 }
 
+// matrix-matrix multiplication kernels
+// see Section 2.4 for details
+// entails spatial blocking and manual loop unrolling
+// the code supports the batch size 3 on n_SIMD lanes
+// such it multiplies 3 * n_SIMD cells in one sweep
+// can be applied in single or double precision
+// operates with 4 times manunal unrolled loops
 template <bool transpose_matrix, bool add, typename Number, typename Number2>
 void
 apply_matrix_vector_product_3(const Number2 *matrix,
@@ -761,6 +794,13 @@ apply_matrix_vector_product_3(const Number2 *matrix,
     }
 }
 
+// matrix-matrix multiplication kernels
+// see Section 2.4 for details
+// entails spatial blocking and manual loop unrolling
+// the code supports the batch size 4 on n_SIMD lanes
+// such it multiplies 4 * n_SIMD cells in one sweep
+// can be applied in single or double precision
+// operates with 4 times manunal unrolled loops
 template <bool transpose_matrix, bool add, typename Number, typename Number2>
 void
 apply_matrix_vector_product_4(const Number2 *matrix,
@@ -1113,6 +1153,7 @@ apply_matrix_vector_product_4(const Number2 *matrix,
     }
 }
 
+// Matrix-free DG operator
 template <int dim_, int n_components = dim_, typename Number = double>
 class Operator : public Subscriptor
 {
@@ -1147,6 +1188,7 @@ public:
        update_quadrature_points);
     data.mg_level = mg_level;
 
+    // reinit matrix-free data and compute the penalty parameter on each element
     matrix_free.reinit(mapping, dof_handler, constraints, quad, data);
     penalty_factor = 1.0 * (this->matrix_free.get_dof_handler().get_fe().degree + 1) *
            (this->matrix_free.get_dof_handler().get_fe().degree + dim) / dim;
@@ -1161,12 +1203,12 @@ public:
       auto const reference_cells =
         matrix_free.get_dof_handler().get_triangulation().get_reference_cells();
 
-      auto const quadrature = reference_cells[0].template get_gauss_type_quadrature<dim>(degree + 1);
+      auto const quadrature = QGaussSimplex<dim>(degree + 1); //reference_cells[0].template get_gauss_type_quadrature<dim>(degree + 1);
       dealii::FEValues<dim> fe_values(mapping, fe, quadrature, dealii::update_JxW_values);
 
-      auto const face_quadrature =
-        reference_cells[0].face_reference_cell(0).template get_gauss_type_quadrature<dim - 1>(degree +
-                                                                                              1);
+      auto const face_quadrature = QGaussSimplex<dim-1>(degree + 1); 
+        //reference_cells[0].face_reference_cell(0).template get_gauss_type_quadrature<dim - 1>(degree +
+          //                                                                                    1);
       dealii::FEFaceValues<dim> fe_face_values(mapping, fe, face_quadrature, dealii::update_JxW_values);
 
       for(unsigned int i = 0; i < n_cells; ++i)
@@ -1257,6 +1299,7 @@ public:
     matrix_free.initialize_dof_vector(vec);
   }
 
+  // reference operator implementation
   virtual void
   vmult(VectorType &dst, const VectorType &src) const
   {
@@ -1272,7 +1315,7 @@ public:
       MatrixFree<dim, number>::DataAccessOnFaces::gradients);
   }
 
-
+  // optimized operator application
   virtual void
   vmult_manual(VectorType &dst, const VectorType &src) const
   {
@@ -1302,7 +1345,7 @@ private:
     return penalty_factor;
   }
 
-
+  // reference implementation using the deal.ii infrastructure
   void
   do_cell_integral_range(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1324,6 +1367,8 @@ private:
       }
   }
 
+  // applies Equation 2.3 to each face
+  // therefore, gets the gradient and values on both sides of the face
   void
   do_face_integral_range(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1350,12 +1395,15 @@ private:
 
         for (unsigned int q = 0; q < integrator_inner.n_q_points; ++q)
           {
+            // get the penalty parameter
              const VectorizedArray<number> sigma =
              std::max(integrator_inner.read_cell_data(array_penalty_parameter),
                    integrator_outer.read_cell_data(array_penalty_parameter)) * get_penalty_factor();
 
+            // compute the solution jump
             const VectorizedArray<number> solution_jump =
               (integrator_inner.get_value(q) - integrator_outer.get_value(q));
+            // compute the average
             const VectorizedArray<number> averaged_normal_derivative =
               (integrator_inner.get_normal_derivative(q) +
                integrator_outer.get_normal_derivative(q)) *
@@ -1393,6 +1441,7 @@ private:
     do_boundary_real(matrix_free, dst, src, range);
   }
 
+  // apply the boundary condition weakly
   void
   do_boundary_real(const MatrixFree<dim, number>               &matrix_free,
                    VectorType                                  &dst,
@@ -1440,6 +1489,7 @@ private:
       }
   }
 
+  // do the optimized cell integral
   void
   do_cell_integral_manual(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1447,6 +1497,7 @@ private:
     const VectorType                            &src,
     const std::pair<unsigned int, unsigned int> &range) const
   {
+    // get data and memeory
     const internal::MatrixFreeFunctions::DoFInfo &dof_info =
       matrix_free.get_dof_info();
     AlignedVector<VectorizedArray<number>> *scratch_data =
@@ -1467,9 +1518,12 @@ private:
     VectorizedArray<number> *gradients_quad =
       scratch_data->begin() + batch_size * dofs_per_cell;
 
+    // helper to read DoFs
     const internal::MatrixFreeFunctions::DoFInfo::DoFAccessIndex ind =
       internal::MatrixFreeFunctions::DoFInfo::dof_access_cell;
 
+    // the DG method only needs one DoF index per cell as the rest can be 
+    // reconstructed from the number of DoFs on each cell
     const std::vector<unsigned int> &dof_indices_cont =
       dof_info.dof_indices_contiguous[ind];
 
@@ -1479,20 +1533,24 @@ private:
     std::bool_constant<internal::is_vectorizable<VectorType, number>::value>
       vector_selector;
 
+    // loop over the cell batch
     for (unsigned int cell = range.first; cell < range.second;
          cell += batch_size)
       {
         // read dof values
+        // get the current batch size
         const unsigned int my_batch_size =
           cell + batch_size <= range.second ? batch_size : range.second - cell;
         for (unsigned int batch = 0; batch < my_batch_size; ++batch)
           {
+            // get the number of filled SIMD lanes
             const unsigned int n_active_lanes =
               matrix_free.n_active_entries_per_cell_batch(cell + batch);
             const bool use_vectorized_path = n_active_lanes == n_lanes;
-
+            // if all lanes are filled use vectorization
             if (use_vectorized_path)
               {
+                // read DoF values from src
                 reader.process_dofs_vectorized_transpose(
                   dofs_per_cell,
                   dof_indices_cont.data() + (cell + batch) * n_lanes,
@@ -1502,6 +1560,7 @@ private:
               }
             else
               {
+                // same lanes are empty, skip them
                 for (unsigned int i = 0; i < dofs_per_cell; ++i)
                   values_dofs[batch * dofs_per_cell + i] = {};
 
@@ -1514,7 +1573,7 @@ private:
               }
           }
 
-        // interpolate
+        // interpolate to the quadrature points
         if (my_batch_size == 4)
           apply_matrix_vector_product_4<true, false>(
             shape_info.data[0].shape_gradients.data(),
@@ -1563,6 +1622,7 @@ private:
             if (matrix_free.get_mapping_info().cell_type[cell + batch] <=
                 internal::MatrixFreeFunctions::affine)
               {
+                // affine case, use constant metric tensor
                 SymmetricTensor<2, dim, VectorizedArray<number>> my_metric;
                 for (unsigned int d = 0; d < dim; ++d)
                   for (unsigned int f = d; f < dim; ++f)
@@ -1574,6 +1634,7 @@ private:
                     }
                 for (unsigned int q = 0; q < n_q_points; ++q)
                   {
+                    // apply at every quadrature point
                     Tensor<1, dim, VectorizedArray<number>> grad;
                     for (unsigned int d = 0; d < dim; ++d)
                       grad[d] =
@@ -1588,6 +1649,7 @@ private:
               }
             else
               {
+                // curvilinear case
                 for (unsigned int q = 0; q < n_q_points; ++q)
                   {
                     Tensor<1, dim, VectorizedArray<number>> grad;
@@ -1672,6 +1734,7 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
+  // optimized face integral implementation
   void
   do_face_integral_manual(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1679,6 +1742,14 @@ private:
     const VectorType                            &src,
     const std::pair<unsigned int, unsigned int> &range) const
   {
+    // now reorder the faces on the fly
+    // only faces sharing the same interpolation matrix can be batched
+    // to perform the matrix-matrix product
+    // the interpolation matrix is dependend on the face index and
+    // the face orientation
+    // note that one side of the face is always in the standard orientation
+    // while the other side is always flipped and possibly rotated
+    // see Section 3.1
     constexpr int                          NUM_FACES        = 4;
     constexpr int                          NUM_ORIENTATIONS = 6;
     std::vector<std::vector<unsigned int>> face_batches(
@@ -1687,25 +1758,30 @@ private:
     for (unsigned int face = range.first; face < range.second; ++face)
       {
         const auto          face_info       = matrix_free.get_face_info(face);
+        // get face index for the inside and outside
         const unsigned char face_number_int = face_info.interior_face_no;
         const unsigned char face_number_ext = face_info.exterior_face_no;
+        // get the orientation for the inside and outside
+        // the inner face is in standard orientation if the first bit is 0
         const unsigned char face_orientation_int =
           (true == (face_info.face_orientation >= 8)) ?
             (face_info.face_orientation % 8) :
             0;
+        // else the outside face is in standard orientation
         const unsigned char face_orientation_ext =
           (false == (face_info.face_orientation >= 8)) ?
             (face_info.face_orientation % 8) :
             0;
-
+        // push the face to the corresponding batch
         face_batches[face_number_int * NUM_FACES * NUM_ORIENTATIONS *
-                       NUM_ORIENTATIONS +
-                     face_number_ext * NUM_ORIENTATIONS * NUM_ORIENTATIONS +
-                     face_orientation_int * NUM_ORIENTATIONS +
-                     face_orientation_ext]
+                      NUM_ORIENTATIONS +
+                    face_number_ext * NUM_ORIENTATIONS * NUM_ORIENTATIONS +
+                    face_orientation_int * NUM_ORIENTATIONS +
+                    face_orientation_ext]
           .push_back(face);
       }
 
+    // evaluated all batches
     for (auto &face_batch : face_batches)
       if (!face_batch.empty())
         compute_batched_face_integrals(matrix_free, dst, src, face_batch);
@@ -1718,6 +1794,7 @@ private:
     const VectorType                &src,
     const std::vector<unsigned int> &face_indices) const
   {
+    // get data, similar to the cell integral
     const internal::MatrixFreeFunctions::DoFInfo &dof_info =
       matrix_free.get_dof_info();
     AlignedVector<VectorizedArray<number>> *scratch_data =
@@ -1744,16 +1821,18 @@ private:
       (false == (face_info.face_orientation >= 8)) ?
         (face_info.face_orientation % 8) :
         0;
-
+     
     const unsigned int n_q_points =
       shape_info.n_q_points_faces[face_number_int];
 
     scratch_data->resize_fast(2 * batch_size *
                               (dim * n_q_points + n_q_points + dofs_per_cell));
+    // set pointers to the values and gradients for the interal and external face
     VectorizedArray<number> *values_dofs_int = scratch_data->begin();
     VectorizedArray<number> *values_dofs_ext =
       scratch_data->begin() + batch_size * dofs_per_cell;
 
+    // now also the value not only the gradient is needed at all quadrature points
     VectorizedArray<number> *values_quad_int =
       scratch_data->begin() + 2 * batch_size * dofs_per_cell;
     VectorizedArray<number> *values_quad_ext = scratch_data->begin() +
@@ -1769,6 +1848,9 @@ private:
 
     const unsigned int n_faces = face_indices.size();
 
+    // get interpolation matrices for the interal and external face
+    // not only the gradients but also the shape functions themselves
+    // evaluated at all quadrature points are needed
     const auto       &shape_data = shape_info.data.front();
     const auto *const shape_values_inner =
       &shape_data.shape_values_face(face_number_int, face_orientation_int, 0);
@@ -1783,11 +1865,13 @@ private:
                                        face_orientation_ext,
                                        0);
 
+    // helper to read DoFs
     const internal::MatrixFreeFunctions::DoFInfo::DoFAccessIndex ind_int =
       internal::MatrixFreeFunctions::DoFInfo::dof_access_face_interior;
     const internal::MatrixFreeFunctions::DoFInfo::DoFAccessIndex ind_ext =
       internal::MatrixFreeFunctions::DoFInfo::dof_access_face_exterior;
 
+    // get DoF indices
     const std::vector<unsigned int> &dof_indices_cont_int =
       dof_info.dof_indices_contiguous[ind_int];
     const std::vector<unsigned int> &dof_indices_cont_ext =
@@ -1861,18 +1945,23 @@ private:
         if (my_batch_size == 4)
           {
             // interpolate
+            // get values and gradients at quadrature points
+            // first for the inside face
+            // looking at the dimensions it is clear that the shape_values
+            // are the ansatz functions evaluated at each quadrature point
+            // resulting in a matrix of size n_q_points x dofs_per_cell
             apply_matrix_vector_product_4<true, false>(shape_values_inner,
                                                        values_dofs_int,
                                                        values_quad_int,
                                                        dofs_per_cell,
                                                        n_q_points);
-
+            // whereas for the gradient the size is n_q_points * dim x dofs_per_cell
             apply_matrix_vector_product_4<true, false>(shape_gradients_inner,
                                                        values_dofs_int,
                                                        gradients_quad_int,
                                                        dofs_per_cell,
                                                        n_q_points * dim);
-
+            // now for the outside face
             apply_matrix_vector_product_4<true, false>(shape_values_outer,
                                                        values_dofs_ext,
                                                        values_quad_ext,
@@ -1887,6 +1976,7 @@ private:
           }
         else if (my_batch_size == 3)
           {
+            // same as above for the case of a smaller batch size
             // interpolate
             apply_matrix_vector_product_3<true, false>(shape_values_inner,
                                                        values_dofs_int,
@@ -2003,6 +2093,7 @@ private:
             const VectorizedArray<number> *j_value =
               &mapping_data.JxW_values[offsets];
 
+            // also get the precomputed product of the normal vector times the Jacobian
             const Tensor<1, dim, VectorizedArray<number>>
               *normal_x_jacobian_int =
                 &mapping_data.normals_times_jacobians[0][offsets];
@@ -2010,13 +2101,15 @@ private:
               *normal_x_jacobian_ext =
                 &mapping_data.normals_times_jacobians[1][offsets];
 
+            // read the penalty parameter for each cell
+            // first get the cell ids
             dealii::VectorizedArray<Number> tau_int;
             dealii::VectorizedArray<Number> tau_ext;
             const auto face_cell = matrix_free.get_face_info(face_indices[face + batch]);
             const std::array<unsigned int, n_lanes> cell_ids_interior = face_cell.cells_interior;
             const std::array<unsigned int, n_lanes> cell_ids_exterior = face_cell.cells_exterior;
 
-            
+            // now read the penalty parameter
             for (unsigned int i = 0; i < n_lanes; ++i)
             {
                 if (cell_ids_interior[i] != dealii::numbers::invalid_unsigned_int)
@@ -2024,7 +2117,7 @@ private:
                 if (cell_ids_exterior[i] != dealii::numbers::invalid_unsigned_int)
                   tau_ext[i] = array_penalty_parameter[cell_ids_exterior[i] / n_lanes][cell_ids_exterior[i] % n_lanes];
             }        
-
+            // compute the right value of inside and outside
             const dealii::VectorizedArray<Number> sigma =
               get_penalty_factor()  * std::max(tau_int,
                   tau_ext);
@@ -2034,18 +2127,22 @@ private:
                   .face_type[face_indices[face + batch]] <=
                 internal::MatrixFreeFunctions::affine)
               {
+                // affine mapping
                 for (unsigned int q = 0; q < n_q_points; ++q)
                   {
+                    // get the jump value
                     const VectorizedArray<number> solution_jump =
                       values_quad_int[batch * n_q_points + q] -
                       values_quad_ext[batch * n_q_points + q];
 
+                    // get the normal gradient 
                     VectorizedArray<number> grad_int =
                       gradients_quad_int[batch * n_q_points * dim + q * dim] *
                       normal_x_jacobian_int[0][0];
                     VectorizedArray<number> grad_ext =
                       gradients_quad_ext[batch * n_q_points * dim + q * dim] *
                       normal_x_jacobian_ext[0][0];
+                    // average value
                     for (unsigned int d = 1; d < dim; ++d)
                       {
                         grad_int +=
@@ -2060,14 +2157,20 @@ private:
                     const VectorizedArray<number> averaged_normal_derivative =
                       number(0.5) * (grad_int + grad_ext);
 
+                    // multiply the jump by the penalty parameter 
+                    // and subtract the average normal
                     const VectorizedArray<number> test_by_value =
                       solution_jump * sigma - averaged_normal_derivative;
-
+                    
+                    // prepare applying the testfunction
                     values_quad_int[batch * n_q_points + q] =
                       test_by_value * j_value[0] * quadrature_weights[q];
+                    // minus sign because of flipped normal
                     values_quad_ext[batch * n_q_points + q] =
                       -test_by_value * j_value[0] * quadrature_weights[q];
-
+                    
+                    // apply the gradient of the testfunction
+                    // again take the shortcut of precomputing the normal times Jacobian
                     for (unsigned int d = 0; d < dim; ++d)
                       {
                         gradients_quad_int[batch * n_q_points * dim + q * dim +
@@ -2087,6 +2190,8 @@ private:
               {
                 for (unsigned int q = 0; q < n_q_points; ++q)
                   {
+                    // curilinear case
+                    // normals depend on quadrature point
                     const VectorizedArray<number> solution_jump =
                       values_quad_int[batch * n_q_points + q] -
                       values_quad_ext[batch * n_q_points + q];
@@ -2134,27 +2239,29 @@ private:
               }
           }
 
+        // interpolate back from the quadrature points to the DoF values
         if (my_batch_size == 4)
           {
             // integrate
+            // inner face, write the values to the face
             apply_matrix_vector_product_4<false, false>(shape_values_inner,
                                                         values_quad_int,
                                                         values_dofs_int,
                                                         dofs_per_cell,
                                                         n_q_points);
-
+            // now add the gradient
             apply_matrix_vector_product_4<false, true>(shape_gradients_inner,
                                                        gradients_quad_int,
                                                        values_dofs_int,
                                                        dofs_per_cell,
                                                        n_q_points * dim);
-
+            // write the values to the outer face
             apply_matrix_vector_product_4<false, false>(shape_values_outer,
                                                         values_quad_ext,
                                                         values_dofs_ext,
                                                         dofs_per_cell,
                                                         n_q_points);
-
+            // add the gradients
             apply_matrix_vector_product_4<false, true>(shape_gradients_outer,
                                                        gradients_quad_ext,
                                                        values_dofs_ext,
@@ -2323,6 +2430,9 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
+  // do the same as for the inner faces
+  // there is only one face in this case
+  // batch identical interpolation matrices
   void
   do_boundary_integral_manual(
     const MatrixFree<dim, number>               &matrix_free,
@@ -2752,7 +2862,7 @@ void
 do_test(const unsigned int fe_degree)
 {
   const bool use_manifold = false;
-  const bool grid_in      = true;
+  const bool grid_in      = false;
   const bool reorder_grid = false;
 
   ConditionalOStream pcout(std::cout,
@@ -2847,7 +2957,7 @@ do_test(const unsigned int fe_degree)
     refinements.resize(1);
 }
 
-  for (unsigned int refinement = 0;  refinement < refinements.size(); ++refinement) //refinement < n_refinements &&
+  for (unsigned int refinement = 1; refinement < refinements.size(); ++refinement) //refinement < n_refinements &&
     {
       const auto serial_grid_generator =
         [&refinement,
@@ -2922,7 +3032,7 @@ do_test(const unsigned int fe_degree)
             {
               // set up triangulation
               GridGenerator::subdivided_hyper_cube_with_simplices(
-                tria_serial, n_subdivisions[refinement]);
+                tria_serial, 1);
               if (use_manifold)
                 {
                   tria_serial.set_all_manifold_ids(0);
@@ -2988,8 +3098,9 @@ do_test(const unsigned int fe_degree)
       for (Number &a : vec1)
         a = static_cast<double>(rand()) / RAND_MAX;
 
+      // deal.ii implementation
       MPI_Barrier(MPI_COMM_WORLD);
-      for (unsigned int r = 0; r < 5; ++r)
+      for (unsigned int r = 0; r < 1; ++r)
         {
 #ifdef LIKWID_PERFMON
           LIKWID_MARKER_START(("matvec_p" + std::to_string(fe_degree) + "_s" +
@@ -3010,6 +3121,7 @@ do_test(const unsigned int fe_degree)
                 << 1e-9 * dof_handler.n_dofs() * 100 / run_time << std::endl;
         }
 
+      // optimied implementation
       for (unsigned int r = 0; r < 5; ++r)
         {
 #ifdef LIKWID_PERFMON

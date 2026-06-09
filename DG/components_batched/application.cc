@@ -1,4 +1,19 @@
-
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the optimized Poisson operator for continuous finite
+ * elements discretizations. Applies the components batched strategie (see Section 2.4),
+ * all optimizations explained in the paper are applied,  
+ * possible choices are curvlinear elements, grid reordering and
+ * single or double precision runs.
+ * Further the code compares the native deal.ii implementation and the sparse global 
+ * matrix version based on Trilinos.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * See DG/cells_batched/application.cc for reference. This application implements the 
+ * components batched strategy, not requiring any reordering of the faces, as
+ * one batch is created by reordering the components of each cell. 
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
@@ -38,6 +53,8 @@
 
 using namespace dealii;
 
+// only need one matrix-matrix kernel, as each batch is given
+// by one cell, such there are no batches, which are only partially filled
 template <bool transpose_matrix, bool add, typename Number, typename Number2>
 void
 apply_matrix_vector_product(const Number2 *matrix,
@@ -374,6 +391,7 @@ apply_matrix_vector_product(const Number2 *matrix,
     }
 }
 
+// defines the operator
 template <int dim_, int n_components = dim_, typename Number = double>
 class Operator : public Subscriptor
 {
@@ -716,6 +734,7 @@ private:
     const number *quadrature_weights =
       mapping_data.descriptor[0].quadrature_weights.data();
 
+    // reserve memory for all components instead of cell batches
     scratch_data->resize_fast(n_components * (dim * n_q_points + dofs_per_cell));
     VectorizedArray<number> *values_dofs = scratch_data->begin();
     VectorizedArray<number> *gradients_quad =
@@ -747,6 +766,7 @@ private:
         } */
 
         // read dof values
+        // still we can skip SIMD lanes which are not filled
         const unsigned int n_active_lanes =
           matrix_free.n_active_entries_per_cell_batch(cell);
         const bool use_vectorized_path = n_active_lanes == n_lanes;
@@ -777,6 +797,9 @@ private:
 
        
         // interpolate
+        // the DoFs for the x-direction are the first dofs_per_cell
+        // entries in the values_dofs vector
+        // the next dofs_per_cell are for the y-direction and so on
         apply_matrix_vector_product<true, false>(
           shape_info.data[0].shape_gradients.data(),
           values_dofs,
@@ -806,6 +829,7 @@ private:
                         sum += jac[0][e][d] * jac[0][e][f];
                       my_metric[d][f] = sum * j_value[0];
                     }
+                // also loop over all components
                 for (unsigned int comp = 0; comp < n_components; ++comp)
                 for (unsigned int q = 0; q < n_q_points; ++q, grad_ptr += dim)
                   {
@@ -869,6 +893,11 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
+  // now do the face integrals
+  // compared to the cells batched version here no 
+  // reordering on the fly is required:
+  // all components on the face share the interpolation
+  // matrix
   void
   do_face_integral_manual(
     const MatrixFree<dim, number>               &matrix_free,
@@ -892,9 +921,10 @@ private:
 
     const unsigned int n_q_points =
       shape_info.n_q_points_faces[0];
-
+    // reserve memory
     scratch_data->resize_fast(2 * n_components *
                               (dim * n_q_points + n_q_points + dofs_per_cell));
+    // set pointers to some regions
     VectorizedArray<number> *values_dofs_int = scratch_data->begin();
     VectorizedArray<number> *values_dofs_ext =
       scratch_data->begin() + n_components * dofs_per_cell;
@@ -967,6 +997,7 @@ private:
 
         if (use_vectorized_path)
         {  
+          // read from the src vector, only need the first cell index
           reader.process_dofs_vectorized_transpose(dofs_per_cell * n_components,
                                                           dof_indices_cont_int.data() + face * n_lanes,
                                                           src,
@@ -987,7 +1018,7 @@ private:
               values_dofs_ext[comp * dofs_per_cell + i] = {};
             }
 
-          
+            // skip empty SIMD lanes
             for (unsigned int i = 0; i < dofs_per_cell; ++i)
             for (unsigned int v = 0; v < n_active_lanes; ++v)
               reader.process_dof(
@@ -1072,6 +1103,7 @@ private:
               .face_type[face] <=
             internal::MatrixFreeFunctions::affine)
             {
+              // go over all components
               for (unsigned int comp = 0; comp < n_components; ++comp)
               for (unsigned int q = 0; q < n_q_points; ++q)
                 {
@@ -1242,6 +1274,7 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
+  // same on the boundary
   void
   do_boundary_integral_manual(
     const MatrixFree<dim, number>               &matrix_free,

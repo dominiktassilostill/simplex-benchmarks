@@ -1,4 +1,17 @@
-
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the optimized Poisson operator for continuous finite
+ * elements discretizations. Applies the components batched strategie (see Section 2.4),
+ * all optimizations explained in the paper are applied,  
+ * possible choices are curvlinear elements, grid reordering and
+ * single or double precision runs.
+ * Further the code compares the native deal.ii implementation and the sparse global 
+ * matrix version based on Trilinos.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * 
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
@@ -43,7 +56,7 @@
 using namespace dealii;
 
 
-
+// matrix-matrix kernels like in CG/cells_batched/application.cc
 template <bool transpose_matrix, typename Number, typename Number2>
 void
 apply_matrix_vector_product_6(const Number2 *matrix,
@@ -761,6 +774,7 @@ apply_matrix_vector_product(const Number2 *matrix,
     }
 }
 
+// matrix-free Poisson operator like in CG/cells_batched/application.cc
 template <int dim_, int n_components = dim_, typename Number = double>
 class Operator : public Subscriptor
 {
@@ -773,6 +787,7 @@ public:
 
   using FECellIntegrator = FEEvaluation<dim, -1, 0, n_components, Number>;
 
+// reinit of the matrix-free data
   void
   reinit(const Mapping<dim>              &mapping,
          const DoFHandler<dim>           &dof_handler,
@@ -816,6 +831,7 @@ public:
 
     constexpr unsigned int n_lanes = VectorizedArray<number>::size();
     const unsigned int n_dofs_per_cell_per_componenet = matrix_free.get_dof_handler().get_fe().base_element(0).dofs_per_cell;
+    // sort DoFs, save all for p = 3, transform to lexicographic numbering
     if (matrix_free.get_dof_handler().get_fe().degree == 3)
     {
       manual_dof_indices.reinit(
@@ -858,6 +874,7 @@ public:
     }
     else
     {
+      // linear or quadratic case, no lexicographic numbering needed
       manual_dof_indices.reinit(
         matrix_free.n_cell_batches(),
         n_dofs_per_cell_per_componenet * n_lanes,
@@ -1001,6 +1018,9 @@ private:
       }
   }
 
+  // same as in CG/cells_batched/application.cc 
+  // here components of one cell are batched into a matrix, instead of multiple cells
+  // see Section 2.4 and Equation 2.13 
   void
   do_cell_integral_masked_gather(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1037,6 +1057,7 @@ private:
                 for (unsigned int i = 0; i < dofs_per_cell;
                      ++i, dof_indices += n_lanes)
                   {
+                    // seperate components of the cell
                     values_dofs[i] = {};
                     values_dofs[dofs_per_cell + i] = {};
                     values_dofs[2 * dofs_per_cell + i] = {};
@@ -1077,6 +1098,7 @@ private:
                 }
           }
 
+        // apply matrix-matrix product to all components of the cell
         apply_matrix_vector_product<true>(
               shape_info.data[0].shape_gradients.data(),
               values_dofs,
@@ -1089,6 +1111,7 @@ private:
               n_q_points * dim);
 
         // quadrature point operation
+        // apply also on all compoenents
           {
             const unsigned int offsets =
               mapping_data.data_index_offsets[cell];
@@ -1140,7 +1163,7 @@ private:
               }
           }
 
-      
+        // interpolate back
         apply_matrix_vector_product<false>(
               shape_info.data[0].shape_gradients.data(),
               gradients_quad,
@@ -1192,6 +1215,7 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
+  // code for cubic elements
   void
   do_cell_integral_masked_gather_cubic(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1375,7 +1399,8 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
-
+  // reference for increasing the batch size
+  // does not lead to any performance gains
   void
   do_cell_integral_masked_gather_6(
     const MatrixFree<dim, number>               &matrix_free,

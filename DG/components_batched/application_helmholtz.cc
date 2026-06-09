@@ -1,4 +1,21 @@
-
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the optimized Poisson operator for continuous finite
+ * elements discretizations. Applies the components batched strategie (see Section 2.4),
+ * all optimizations explained in the paper are applied,  
+ * possible choices are curvlinear elements, grid reordering and
+ * single or double precision runs.
+ * Further the code compares the native deal.ii implementation and the sparse global 
+ * matrix version based on Trilinos.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * See DG/components_batched/application.cc for reference. This application implements the 
+ * components batched strategy for a Helmholtz like operator, as explained in Section 4.2 in
+ * the paper. The difference to the Poisson operator is the addition of the mass term, which
+ * can be seen in the cell integral. The same optimizations are used to evaluated the values
+ * at the quadrature points are as used for the gradients. 
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
@@ -950,6 +967,7 @@ const VectorizedArray<number> inverse_length_normal_to_face =
 
     scratch_data->resize_fast(n_components * (n_q_points + dim * n_q_points + dofs_per_cell));
     VectorizedArray<number> *values_dofs = scratch_data->begin();
+    // we need the values at the quadrature points additional to the gradients 
     VectorizedArray<number> *values_quad =
       scratch_data->begin() + n_components * dofs_per_cell;
     VectorizedArray<number> *gradients_quad =
@@ -1002,6 +1020,8 @@ const VectorizedArray<number> inverse_length_normal_to_face =
 
        
         // interpolate
+        // same as on the faces
+        // now first interpolate the values then the gradients
         apply_matrix_vector_product<true, false>(
           shape_info.data[0].shape_values.data(),
           values_dofs,
@@ -1049,7 +1069,10 @@ const VectorizedArray<number> inverse_length_normal_to_face =
                     const number weight = quadrature_weights[q];
                     for (unsigned int d = 0; d < dim; ++d)
                       grad_ptr[d] = weight * result[d];
-  	                values_quad[comp * n_q_points + q] *= number(1e5)*weight * j_value[0];
+                    // apply the quadrature weights and determinant of the Jacobian also to
+                    // the values at each quadrature point
+                    // note that the constant is from the physical constants, see Equation 4.6 
+  	                values_quad[comp * n_q_points + q] *= number(1e5) * weight * j_value[0];
                     
                   }
               }
@@ -1071,6 +1094,7 @@ const VectorizedArray<number> inverse_length_normal_to_face =
           }
         
           // integrate
+          // write the first time
            apply_matrix_vector_product<false, false>(
             shape_info.data[0].shape_values.data(),
             values_quad,
@@ -1078,6 +1102,7 @@ const VectorizedArray<number> inverse_length_normal_to_face =
             dofs_per_cell,
             n_q_points);
 
+          // now add into the vector
           apply_matrix_vector_product<false, true>(
             shape_info.data[0].shape_gradients.data(),
             gradients_quad,
@@ -2030,6 +2055,7 @@ do_test(const unsigned int fe_degree)
 
 
       op.rhs(vec4);
+      // apply conjugate gradient solver
       ReductionControl reduction_control(1e4, 1e-12*vec4.l2_norm());
       SolverCG<LinearAlgebra::distributed::Vector<Number>> solver(reduction_control);
 
