@@ -2130,30 +2130,28 @@ private:
                 // affine mapping
                 for (unsigned int q = 0; q < n_q_points; ++q)
                   {
-                    const unsigned int q_int = quad_offsets[face_orientation_int][q];
-                    const unsigned int q_ext = quad_offsets[face_orientation_ext][q];
                     // get the jump value
                     const VectorizedArray<number> solution_jump =
-                      values_quad_int[batch * n_q_points + q_int] -
-                      values_quad_ext[batch * n_q_points + q_ext];
+                      values_quad_int[batch * n_q_points + q] -
+                      values_quad_ext[batch * n_q_points + q];
 
                     // get the normal gradient 
                     VectorizedArray<number> grad_int =
-                      gradients_quad_int[batch * n_q_points * dim + q_int * dim] *
+                      gradients_quad_int[batch * n_q_points * dim + q * dim] *
                       normal_x_jacobian_int[0][0];
                     VectorizedArray<number> grad_ext =
-                      gradients_quad_ext[batch * n_q_points * dim + q_ext * dim] *
+                      gradients_quad_ext[batch * n_q_points * dim + q * dim] *
                       normal_x_jacobian_ext[0][0];
                     // average value
                     for (unsigned int d = 1; d < dim; ++d)
                       {
                         grad_int +=
                           gradients_quad_int[batch * n_q_points * dim +
-                                             q_int * dim + d] *
+                                             q * dim + d] *
                           normal_x_jacobian_int[0][d];
                         grad_ext +=
                           gradients_quad_ext[batch * n_q_points * dim +
-                                             q_ext * dim + d] *
+                                             q * dim + d] *
                           normal_x_jacobian_ext[0][d];
                       }
                     const VectorizedArray<number> averaged_normal_derivative =
@@ -2165,25 +2163,25 @@ private:
                       solution_jump * sigma - averaged_normal_derivative;
                     
                     // prepare applying the testfunction
-                    values_quad_int[batch * n_q_points + q_int] =
-                      test_by_value * j_value[0] * quadrature_weights[q_int];
+                    values_quad_int[batch * n_q_points + q] =
+                      test_by_value * j_value[0] * quadrature_weights[q];
                     // minus sign because of flipped normal
-                    values_quad_ext[batch * n_q_points + q_ext] =
-                      -test_by_value * j_value[0] * quadrature_weights[q_ext];
+                    values_quad_ext[batch * n_q_points + q] =
+                      -test_by_value * j_value[0] * quadrature_weights[q];
                     
                     // apply the gradient of the testfunction
                     // again take the shortcut of precomputing the normal times Jacobian
                     for (unsigned int d = 0; d < dim; ++d)
                       {
-                        gradients_quad_int[batch * n_q_points * dim + q_int * dim +
+                        gradients_quad_int[batch * n_q_points * dim + q * dim +
                                            d] =
                           (-solution_jump * number(0.5) * j_value[0] *
-                           quadrature_weights[q_int]) *
+                           quadrature_weights[q]) *
                           normal_x_jacobian_int[0][d];
-                        gradients_quad_ext[batch * n_q_points * dim + q_ext * dim +
+                        gradients_quad_ext[batch * n_q_points * dim + q * dim +
                                            d] =
                           (-solution_jump * number(0.5) * j_value[0] *
-                           quadrature_weights[q_ext]) *
+                           quadrature_weights[q]) *
                           normal_x_jacobian_ext[0][d];
                       }
                   }
