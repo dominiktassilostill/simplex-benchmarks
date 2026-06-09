@@ -1,4 +1,17 @@
-
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the optimized Poisson operator for continuous finite
+ * elements discretizations. Applies the cells batched strategie (see Section 2.4),
+ * all optimizations explained in the paper are applied,  
+ * possible choices are multiple components, curvlinear elements, grid reordering and
+ * single or double precision runs.
+ * Further the code compares the native deal.ii implementation and the sparse global 
+ * matrix version based on Trilinos.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * 
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
@@ -41,6 +54,12 @@
 
 using namespace dealii;
 
+// matrix-matrix multiplication kernels
+// see Section 2.4 for details
+// entails spatial blocking and manual loop unrolling
+// the code supports the batch size 6 on n_SIMD lanes
+// such it multiplies 6 * n_SIMD cells in one sweep
+// can be applied in single or double precision
 template <bool transpose_matrix, typename Number, typename Number2>
 void
 apply_matrix_vector_product_6(const Number2 *matrix,
@@ -476,6 +495,12 @@ apply_matrix_vector_product_6(const Number2 *matrix,
     }
 }
 
+// matrix-matrix multiplication kernels
+// for the interpolation step
+// entails spatial blocking and manual loop unrolling
+// the code supports the batch size 2 on n_SIMD lanes
+// such it multiplies 2 * n_SIMD cells in one sweep
+// can be applied in single or double precision
 template <bool transpose_matrix, typename Number, typename Number2>
 void
 apply_matrix_vector_product(const Number2 *matrix,
@@ -703,7 +728,12 @@ apply_matrix_vector_product(const Number2 *matrix,
 }
 
 
-
+// matrix-matrix multiplication kernels
+// for the interpolation step
+// entails spatial blocking and manual loop unrolling
+// the code supports the batch size 4 on n_SIMD lanes
+// such it multiplies 4 * n_SIMD cells in one sweep
+// can be applied in single or double precision
 template <bool transpose_matrix, typename Number, typename Number2>
 void
 apply_matrix_vector_product(const Number2 *matrix,
@@ -1005,7 +1035,8 @@ apply_matrix_vector_product(const Number2 *matrix,
 }
 
 
-
+// matrix-free Poission operator
+// runs in single or double precision
 template <int dim_, int n_components = dim_, typename Number = double>
 class Operator : public Subscriptor
 {
@@ -1018,6 +1049,10 @@ public:
 
   using FECellIntegrator = FEEvaluation<dim, -1, 0, n_components, Number>;
 
+  // reinit the matrix-free data
+  // update mappings and constraints
+  // save all local relevant DoF indices 
+  // and constraints DoFs for optimized access 
   void
   reinit(const Mapping<dim>              &mapping,
          const DoFHandler<dim>           &dof_handler,
@@ -1115,6 +1150,7 @@ public:
     matrix_free.initialize_dof_vector(vec);
   }
 
+  // standard implementation in deal.ii
   virtual void
   vmult(VectorType &dst, const VectorType &src) const
   {
@@ -1126,6 +1162,8 @@ public:
         src.local_element(constrained_indices[i]);
   }
 
+  // implementation of the optimized operator application as descriped in the paper
+  // uses the instruction scheduling optimizations
   virtual void
   vmult_masked_gather(VectorType &dst, const VectorType &src) const
   {
@@ -1137,6 +1175,9 @@ public:
         src.local_element(constrained_indices[i]);
   }
 
+  // same as above but with 6 cells batched into one matrix
+  // implementation of the optimized operator application as descriped in the paper
+  // uses the instruction scheduling optimizations
   virtual void
   vmult_masked_gather_6(VectorType &dst, const VectorType &src) const
   {
@@ -1161,6 +1202,7 @@ public:
   }
 
 private:
+  // computes the gradient in real space and applies the gradient of the test function
   void
   do_cell_integral_global(FECellIntegrator &integrator,
                           VectorType       &dst,
@@ -1174,6 +1216,7 @@ private:
     integrator.integrate_scatter(EvaluationFlags::gradients, dst);
   }
 
+  // loops over cells and call the local cell operations
   void
   do_cell_integral_range(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1190,6 +1233,7 @@ private:
       }
   }
 
+  // execute the instruction scheduling approach (see Section 2.4 in the paper)
   void
   do_cell_integral_masked_gather(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1197,40 +1241,51 @@ private:
     const VectorType                            &src,
     const std::pair<unsigned int, unsigned int> &range) const
   {
+    // get data on the referece cell
     AlignedVector<VectorizedArray<number>> *scratch_data =
       matrix_free.acquire_scratch_data();
     const internal::MatrixFreeFunctions::ShapeInfo<number> &shape_info =
       matrix_free.get_shape_info();
     const unsigned int dofs_per_cell  = shape_info.dofs_per_component_on_cell;
+    // set the batch size
     constexpr unsigned int batch_size = 4;
     const unsigned int     n_q_points = shape_info.n_q_points;
+    // get the SIMD width
     constexpr unsigned int n_lanes    = VectorizedArray<number>::size();
 
+    // get mapping data and quadrature weights
     const auto   &mapping_data = matrix_free.get_mapping_info().cell_data[0];
     const number *quadrature_weights =
       mapping_data.descriptor[0].quadrature_weights.data();
 
+    // reserve space for the gradients interpolated to the quadrature points
     scratch_data->resize_fast(batch_size * (dim * n_q_points + dofs_per_cell));
+    // and set pointers
     VectorizedArray<number> *values_dofs = scratch_data->begin();
     VectorizedArray<number> *gradients_quad =
       scratch_data->begin() + batch_size * dofs_per_cell;
 
+    // loop over the local cells
     for (unsigned int cell = range.first; cell < range.second;
          cell += batch_size)
       {
-        // read dof values
+        // read dof values manually to prevent deal.ii overhead
+        // step G_e u
         const unsigned int my_batch_size =
           cell + batch_size <= range.second ? batch_size : range.second - cell;
+        // get DoF indices of each cell in the batch
         const unsigned int *dof_indices = &manual_dof_indices(cell, 0);
         for (unsigned int batch = 0; batch < my_batch_size; ++batch)
           {
             const number *src_ptr = src.begin();
+            // if the cell has constrained DoFs, read only the non constrained DoFs
             if (dof_indices_have_constraints[cell + batch])
               {
                 for (unsigned int i = 0; i < dofs_per_cell;
                      ++i, dof_indices += n_lanes)
                   {
                     values_dofs[batch * dofs_per_cell + i] = {};
+                    // loop over all SIMD lanes
                     for (unsigned int v = 0; v < n_lanes; ++v)
                       if (dof_indices[v] != numbers::invalid_unsigned_int)
                         values_dofs[batch * dofs_per_cell + i][v] =
@@ -1238,6 +1293,8 @@ private:
                   }
               }
             else
+            // no constraints on this cell
+            // read all DoFs on the cell
               for (unsigned int i = 0; i < dofs_per_cell;
                    ++i, dof_indices += n_lanes)
                 {
@@ -1248,7 +1305,12 @@ private:
                 }
           }
 
-        // interpolate
+        // interpolation step E_e u_e
+        // apply the matrix-matrix product to the cells batched together above
+        // (called MM-Mult in the paper)
+        // note that in shape_info.data[0].shape_gradients.data()
+        // the gradient of all shape functions are evaluated at all quadrature points
+        // on the reference element (as described in the data structures) section
         apply_matrix_vector_product<true>(
           shape_info.data[0].shape_gradients.data(),
           values_dofs,
@@ -1256,9 +1318,10 @@ private:
           dofs_per_cell,
           n_q_points * dim);
 
-        // quadrature point operation
+        // quadrature point operation D_e
         for (unsigned int batch = 0; batch < my_batch_size; ++batch)
           {
+            // Get Jacobians
             const unsigned int offsets =
               mapping_data.data_index_offsets[cell + batch];
             const Tensor<2, dim, VectorizedArray<number>> *jac =
@@ -1270,6 +1333,7 @@ private:
             if (matrix_free.get_mapping_info().cell_type[cell + batch] <=
                 internal::MatrixFreeFunctions::affine)
               {
+                // Compute metric tensor $J^{-1}J^{-T}$ as it is constant on one cell over all quadrature points
                 SymmetricTensor<2, dim, VectorizedArray<number>> my_metric;
                 for (unsigned int d = 0; d < dim; ++d)
                   for (unsigned int f = d; f < dim; ++f)
@@ -1282,6 +1346,8 @@ private:
 
                 for (unsigned int q = 0; q < n_q_points; ++q, grad_ptr += dim)
                   {
+                    // get transform gradient to the real space and back
+                    // also apply JxW
                     Tensor<1, dim, VectorizedArray<number>> grad;
                     for (unsigned int d = 0; d < dim; ++d)
                       grad[d] = grad_ptr[d];
@@ -1294,6 +1360,9 @@ private:
               }
             else
               {
+                // curvilinear case
+                // compute the gradient in real space and transform back
+                // apply JxW at every quadrature point
                 for (unsigned int q = 0; q < n_q_points; ++q, grad_ptr += dim)
                   {
                     Tensor<1, dim, VectorizedArray<number>> grad;
@@ -1307,7 +1376,8 @@ private:
               }
           }
 
-        // integrate
+        // integrate E_e^T
+        // use same optimizations as before
         apply_matrix_vector_product<false>(
           shape_info.data[0].shape_gradients.data(),
           gradients_quad,
@@ -1315,7 +1385,8 @@ private:
           dofs_per_cell,
           n_q_points * dim);
 
-        // distribute local to global
+        // distribute local to global G_e^T
+        // skip constrained indices
         dof_indices = &manual_dof_indices(cell, 0);
         for (unsigned int batch = 0; batch < my_batch_size; ++batch)
           {
@@ -1344,6 +1415,7 @@ private:
     matrix_free.release_scratch_data(scratch_data);
   }
 
+  // same as before, only batches 6 cells together instead of 4
   void
   do_cell_integral_masked_gather_6(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1525,8 +1597,11 @@ template <int dim, typename Number>
 void
 do_test(const unsigned int fe_degree)
 {
+  // use a manifold for the curvilinear cae
    const bool use_manifold = false;
+   // read external grid 
    const bool grid_in = false;
+   // reorder external grid according to Section 2.5
    const bool reorder_grid = false;
 
   ConditionalOStream pcout(std::cout,
@@ -1590,6 +1665,7 @@ do_test(const unsigned int fe_degree)
     n_current = n_5[index_5];
   }}
 
+  // setup the manifold
   Point<dim> center;
   for (unsigned int d = 0; d < dim; ++d)
   {
@@ -1600,6 +1676,7 @@ do_test(const unsigned int fe_degree)
   }
   const SphericalManifold<dim> manifold(center);
 
+  // choose maximum number of refinements
   unsigned int n_refinements;
   if (fe_degree == 3)
     n_refinements = 17;
@@ -1610,60 +1687,69 @@ do_test(const unsigned int fe_degree)
     n_refinements = 1;
 
 
+  // perform benchmark on different mesh sizes
   for (unsigned int refinement = 0; refinement < n_refinements; ++refinement)
     {
       const auto serial_grid_generator =
         [&refinement, &refinements, &n_subdivisions, &manifold, use_manifold, grid_in, reorder_grid](dealii::Triangulation<dim, dim> &tria_serial) {
+          // read grid
           if (grid_in)
           {
+            // hierarchical grid reordering
             if (reorder_grid)
              {
+              // read external grid
               dealii::Triangulation<dim, dim> tria_in;
               dealii::GridIn<dim> grid_in;
               grid_in.attach_triangulation(tria_in);
               std::ifstream input_file("lung.vtk");
               grid_in.read_vtk(input_file);
 
-
+              // get vertex connectivity of the grid
               dealii::DynamicSparsityPattern cell_connectivity;
               dealii::GridTools::get_vertex_connectivity_of_cells(tria_in, cell_connectivity);
               std::vector<long unsigned int> cell_numbering;
               cell_numbering.resize(tria_in.n_cells(0));
+              // execute the hierarchical reordering
               SparsityTools::reorder_hierarchical(cell_connectivity, cell_numbering);
               std::vector<long unsigned int> cell_numbering_inverse = Utilities::invert_permutation(cell_numbering);
 
+              // setup new grid according to the reordering
               std::vector<Point<dim>> vertices(tria_in.n_vertices());
               std::vector<CellData<dim>>   cells(tria_in.n_cells(0));
 
+              // copy all vertices
               for (const auto &cell : tria_in.active_cell_iterators())
                 for (const unsigned int v : cell->vertex_indices())
                   vertices[cell->vertex_index(v)] = cell->vertex(v);
 
-              
+              // loop over all cells
               for (unsigned int idx = 0; idx < tria_in.n_cells(0); ++idx)
               {
+                // get new corase cell id
                 const unsigned int coarse_cell_idx = cell_numbering_inverse[idx];
                 typename Triangulation<dim, dim>::cell_iterator coarse_cell(
                   &tria_in, 0, coarse_cell_idx);
 
-                
+                // build tet on the new cell
                 CellData<dim> tet(0);
                 
                 for (const unsigned int v : coarse_cell->vertex_indices())
                   tet.vertices.emplace_back(coarse_cell->vertex_index(v));
                 cells[idx] = tet; //
               }
-
+              // build triangulation
               tria_serial.create_triangulation(vertices, cells, SubCellData());
              }
             else
              {
+              // no reordering, just read the grid
               dealii::GridIn<dim> grid_in;
               grid_in.attach_triangulation(tria_serial);
               std::ifstream input_file("lung.vtk");
               grid_in.read_vtk(input_file);
              }
-            
+            // set boundary ids
             for(auto &cell : tria_serial.active_cell_iterators())
               for(auto const & f : cell->face_indices())
                 if(cell->face(f)->at_boundary())
@@ -1674,12 +1760,13 @@ do_test(const unsigned int fe_degree)
           {
             // set up triangulation
             GridGenerator::subdivided_hyper_cube_with_simplices(tria_serial, n_subdivisions[refinement]);
+            // use manifold if needed
             if (use_manifold)
             {
               tria_serial.set_all_manifold_ids(0);
               tria_serial.set_manifold(0, manifold);          
             }
-
+            // refine grid
             tria_serial.refine_global(refinements[refinement]);
           }
         };
@@ -1687,6 +1774,7 @@ do_test(const unsigned int fe_degree)
         [&](dealii::Triangulation<dim, dim> &tria_serial,
             const MPI_Comm                   comm,
             const unsigned int) {
+          // partition grid
           dealii::GridTools::partition_triangulation_zorder(
             dealii::Utilities::MPI::n_mpi_processes(comm), tria_serial);
         };
@@ -1709,7 +1797,7 @@ do_test(const unsigned int fe_degree)
           group_size,
           dealii::Triangulation<dim>::none,
           triangulation_description_setting);
-
+      // build triangulation
       tria.create_triangulation(description);
 
       if (use_manifold)
@@ -1769,16 +1857,18 @@ do_test(const unsigned int fe_degree)
                     << " " << memory.avg << " " << memory.max << std::endl;
       }
 
+      // init global vectors
       LinearAlgebra::distributed::Vector<Number> vec1, vec2, vec3, vec4;
       op.initialize_dof_vector(vec1);
       op.initialize_dof_vector(vec2);
       op.initialize_dof_vector(vec3);
       op.initialize_dof_vector(vec4);
-
+      // fill one vector
       for (Number &a : vec1)
         a = static_cast<double>(rand()) / RAND_MAX;
 
-       for (unsigned int r = 0; r < 5; ++r)
+      // measure operator application time: deal.ii implementation
+      for (unsigned int r = 0; r < 5; ++r)
         {
           Timer time;
 #ifdef LIKWID_PERFMON
@@ -1799,7 +1889,7 @@ do_test(const unsigned int fe_degree)
                 << 1e-9 * dof_handler.n_dofs() * 100 / run_time << std::endl;
         }
       
-      
+      // measure operator application time: instruction scheduling
       for (unsigned int r = 0; r < 5; ++r)
         {
           Timer time;
@@ -1821,6 +1911,7 @@ do_test(const unsigned int fe_degree)
                 << 1e-9 * dof_handler.n_dofs() * 100 / run_time << std::endl;
         }
 
+      // measure operator application time: instruction scheduling with 6 cells batched
       for (unsigned int r = 0; r < 5; ++r)
         {
           Timer time;
@@ -1843,12 +1934,14 @@ do_test(const unsigned int fe_degree)
         }
       pcout << std::endl;
 
+      // print out differences, should be 0
       vec3 -= vec2;
       vec4 -=vec2;
       pcout << "   Norm MF variant: " << vec3.l2_norm() / vec2.l2_norm() <<  vec4.l2_norm() / vec2.l2_norm() << std::endl;
 
       print_memory_stats(tria.get_communicator(), "end experiment");
 
+      // construct global sparse matrix
       const bool do_matrix = false;
       if (do_matrix)
       {
@@ -1869,7 +1962,7 @@ do_test(const unsigned int fe_degree)
 
         pcout << "Matrix nnz/dof: "
               << (double)matrix.n_nonzero_elements() / matrix.m() << std::endl;
-
+        // get sparse matrix timings
         for (unsigned int r = 0; r < 5; ++r)
           {
             Timer time;

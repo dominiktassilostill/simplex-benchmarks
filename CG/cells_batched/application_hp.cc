@@ -1,4 +1,16 @@
-
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the hp-Multigrid preconditioner
+ * with the optimized Poisson operator for continuous finite
+ * elements discretizations. All optimizations explained in the paper are applied,  
+ * possible choices are multiple components, curvlinear elements, grid reordering and
+ * mixed precision or double precision runs.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * This multigrid version first uses coarser grids and then employs polynomial
+ * coarsening to reach coarser levels.
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
@@ -57,6 +69,8 @@
 
 using namespace dealii;
 
+
+// define RHS
 double const FREQUENCY = 3.0 * dealii::numbers::PI;
 
 template <int dim>
@@ -79,7 +93,7 @@ public:
 
 };
 
-
+// define solution
 template <int dim>
 class AnalyticalSolution : public dealii::Function<dim>
 {
@@ -100,6 +114,7 @@ public:
 
 };
 
+// helper function to get values in all SIMD lanes
 template <int dim, typename Number>
 VectorizedArray<Number>
 evaluate_function(const Function<dim>                       &function,
@@ -119,7 +134,8 @@ evaluate_function(const Function<dim>                       &function,
 
 
 
-
+// see application.CG/cells_batched/application.cc for further information on 
+// the matrix-free operator
 template <bool transpose_matrix, bool add, typename Number, typename Number2>
 void
 apply_matrix_vector_product_2(const Number2 *matrix,
@@ -1197,6 +1213,7 @@ apply_matrix_vector_product_4(const Number2 *matrix,
     }
 }
 
+// matrix-free operator as in application.cc
 template <int dim_, typename Number = double>
 class Operator : public Subscriptor
 {
@@ -1344,7 +1361,7 @@ public:
         src.local_element(constrained_indices[i]);
   }
 
-
+  // apply the RHS on a vector in the matrix-free setting
   virtual void
   rhs(VectorType &dst) const
   {
@@ -1366,6 +1383,7 @@ public:
     return matrix_free;
   }
 
+  // computes the inverse diagonal
   void
   compute_inverse_diagonal(VectorType &diagonal_vector) const
   {
@@ -1390,6 +1408,7 @@ public:
       }
   }
 
+  // computes the system matrix
   void
   get_system_matrix(TrilinosWrappers::SparseMatrix &system_matrix)
   {
@@ -1418,7 +1437,8 @@ public:
       0);
   }
 
-private:  
+private: 
+// apply the RHS to a vector 
   void
   rhs_range(
     const MatrixFree<dim, number>               &matrix_free,
@@ -1433,13 +1453,13 @@ private:
       {
         integrator.reinit(cell);
         
-
+        // evaluate the RHS function at all quadature points
         for (unsigned int q = 0; q < integrator.n_q_points; ++q)
         {
           const auto f = evaluate_function(rhs, integrator.quadrature_point(q));
           integrator.submit_value(f, q);
         }
-
+        // interpolate to DoF values and scatter in the global vector
         integrator.integrate_scatter(EvaluationFlags::values, dst);
       }
   }
@@ -1710,6 +1730,8 @@ private:
   bool                                     is_singular;
 };
 
+// setup MG preconditioner
+// templates determine if mixed-precision or double precision is applied
 template <int dim, typename number_operator, typename number = number_operator>
 class MultigridPreconditioner
 {
@@ -1725,12 +1747,12 @@ class MultigridPreconditioner
     PreconditionMG<dim, VectorType, MGTransferGlobalCoarsening<dim, VectorType>>;
 
 public:
-  MultigridPreconditioner(SystemMatrixType &opppppp)
+  MultigridPreconditioner(SystemMatrixType &op)
   {
     const auto &dof_handler =
-      opppppp.get_matrix_free().get_dof_handler();
+      op.get_matrix_free().get_dof_handler();
 
-    // create coarse grid triangulations
+    // create coarse grid triangulations for the h-MG part
     {
       const unsigned int n_global_levels =  dof_handler.get_triangulation().n_global_levels();
       coarse_grid_triangulations.reserve(n_global_levels);
@@ -1775,6 +1797,7 @@ public:
 
     const unsigned int n_h_levels = coarse_grid_triangulations.size() - 1;
 
+    // get polynomial degrees for the different levels
     const std::vector<unsigned int> level_degrees =
         MGTransferGlobalCoarseningTools::create_polynomial_coarsening_sequence(
           dof_handler.get_fe().degree,
@@ -1785,11 +1808,13 @@ public:
     const unsigned int maxlevel =
       n_h_levels + n_p_levels - 1;
 
+    // reserve space for operators on each level
     dof_handlers.resize(minlevel, maxlevel);
     mg_matrices.resize(minlevel, maxlevel);
     
     transfers.resize(minlevel, maxlevel);
 
+    // setup each level
     unsigned int l = 0;
     // p-MG with linear elements
     for (unsigned int i = 0; i < level_degrees.size(); ++i)
@@ -1851,7 +1876,7 @@ public:
           VectorTools::interpolate_boundary_values(
             mapping, dof_handlers[level], 0, Functions::ZeroFunction<dim, number>(1), constraint);
           constraint.close();
-
+          // reinit matrix-free operator
           mg_matrices[level].reinit(MappingFE<dim>(FE_SimplexP<dim>(1)), dof_handlers[level], quadrature, constraint, numbers::invalid_unsigned_int, true);
         }      
       }
@@ -1906,7 +1931,7 @@ public:
   }
 
   unsigned int
-  solve(SystemMatrixType       &oppp,
+  solve(SystemMatrixType       &op,
         VectorTypeSystem       &x,
         const VectorTypeSystem &b)
   {
@@ -1920,18 +1945,19 @@ public:
     Multigrid<VectorType>  mg(mg_matrix, *mg_coarse, transfer, mg_smoother, mg_smoother);
 
     PreconditionerType preconditioner(
-      oppp.get_matrix_free().get_dof_handler(), mg, transfer);
+      op.get_matrix_free().get_dof_handler(), mg, transfer);
 
     SolverControl              control(100000, 1e-10 * b.l2_norm());
     SolverCG<VectorTypeSystem> solver_cg(control);
 
+    // run solve 100 times to get average time to solution
     double min_time = 10000000000.;
     double time_total = 0.;
     for(unsigned int t = 0; t < 100; ++t)
     {
       x = 0.;
       Timer time;
-      solver_cg.solve(oppp, x, b, preconditioner);
+      solver_cg.solve(op, x, b, preconditioner);
       const double run_time = time.wall_time();
       min_time = std::min(min_time, run_time);
       time_total += run_time;
@@ -1942,11 +1968,11 @@ public:
       Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) ==
         0);
     unsigned int n    = control.last_step();
-    pcout << "n_dofs " << oppp.get_matrix_free().get_dof_handler().n_dofs() << "  time "
+    pcout << "n_dofs " << op.get_matrix_free().get_dof_handler().n_dofs() << "  time "
                 << time_total / 100 << "   1e5 DoFs/s "
-                << 1e-5 * oppp.get_matrix_free().get_dof_handler().n_dofs() * 100 / time_total << " in " << n << " iterations" << std::endl;
+                << 1e-5 * op.get_matrix_free().get_dof_handler().n_dofs() * 100 / time_total << " in " << n << " iterations" << std::endl;
 
-    
+    // print further information
     double l2_0 = control.initial_value();
     double l2_n = control.last_value();
     double rho = std::pow(l2_n / l2_0, 1.0 / n);
@@ -1954,7 +1980,7 @@ public:
     unsigned int const N_mpi_processes = dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD);
     double const t_10 = run_time * double(n10) / double(n);
   
-    double const tau_10 = t_10 * (double)N_mpi_processes / oppp.get_matrix_free().get_dof_handler().n_dofs();
+    double const tau_10 = t_10 * (double)N_mpi_processes / op.get_matrix_free().get_dof_handler().n_dofs();
     const double E_10 = 1.0 / tau_10;
 
     pcout << "n_10 " << n10 << "  t_10 "
@@ -1998,6 +2024,7 @@ do_test(const unsigned int fe_degree)
 
   AffineConstraints<Number> constraint;
 
+  // setup the fine level
   for (unsigned int refinement = 0;  refinement < 3; ++refinement) //refinement < n_refinements &&
     {
       const auto serial_grid_generator =
@@ -2039,7 +2066,7 @@ do_test(const unsigned int fe_degree)
       dof_handler.distribute_dofs(fe);
 
       constraint.clear();
-            // set up constraints, then renumber dofs, and set up constraints again
+      // set up constraints, then renumber dofs, and set up constraints again
       if (false)
         {
           const IndexSet locally_relevant_dofs =
@@ -2087,6 +2114,7 @@ do_test(const unsigned int fe_degree)
       for (Number &a : vec1)
         a = static_cast<double>(rand()) / RAND_MAX;
 
+      // test the operator evaluation
       MPI_Barrier(MPI_COMM_WORLD);
       for (unsigned int r = 0; r < 1; ++r)
         {
@@ -2108,7 +2136,8 @@ do_test(const unsigned int fe_degree)
                 << run_time / 1 << "  GDoFs/s "
                 << 1e-9 * dof_handler.n_dofs() * 1 / run_time << std::endl;
         }
-
+      
+      // get reference values
       for (unsigned int r = 0; r < 1; ++r)
         {
 #ifdef LIKWID_PERFMON
@@ -2136,7 +2165,10 @@ do_test(const unsigned int fe_degree)
 
       unsigned int n_iterations = 0;
       op.rhs(b);
-
+      
+      // create mixed precision MG
+      // change from float to Number to use double precision also in MG preconditioner
+      // assuming Number is double
       MultigridPreconditioner<dim, Number, float> multigrid(op);
 
       MPI_Barrier(MPI_COMM_WORLD);

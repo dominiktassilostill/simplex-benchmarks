@@ -1,3 +1,17 @@
+/**  
+ * Code from "Matrix-Free Evaluation Strategies for Continuous and Discontinuous 
+ * Galerkin Discretizations on Unstructured Tetrahedral Grids".
+ * This application benchmarks the hp-Multigrid preconditioner
+ * with the optimized Poisson operator for continuous finite
+ * elements discretizations. All optimizations explained in the paper are applied,  
+ * possible choices are multiple components, curvlinear elements, grid reordering and
+ * mixed precision or double precision runs.
+ * Performance metrics can be infered with likwid, yet it is not mandatory to run the
+ * program.
+ * See application_ph.cc for more information, differences between the two versions are 
+ * the sequence of multigrid levels. Here, first the polynomial degree is lowered until
+ * linear elements are used, then geometric multigrid is employed to reach coarser levels.
+*/
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/mpi.h>
